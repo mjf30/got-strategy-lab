@@ -246,7 +246,7 @@ fn pending_involves(pending: &PendingDecision, house: HouseName) -> bool {
         PendingDecision::Muster { house: h, .. } => *h == house,
         PendingDecision::Bidding { .. } => true, // All houses bid simultaneously
         PendingDecision::LeavePowerToken { .. } => true,
-        PendingDecision::UseValyrianBlade => true,
+        PendingDecision::UseValyrianBlade { .. } => true,
         PendingDecision::PlaceOrders { house: h } => *h == house,
         PendingDecision::ChooseRaid { house: h, .. } => *h == house,
         PendingDecision::ChooseMarch { house: h, .. } => *h == house,

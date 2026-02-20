@@ -318,9 +318,10 @@ pub struct Garrison {
 pub struct BiddingState {
     pub bidding_type: BiddingType,
     pub bids: HashMap<HouseName, u8>,
-    pub resolved: bool,
     pub current_track: Option<Track>,
     pub remaining_tracks: Vec<Track>,
+    pub bid_order: Vec<HouseName>,
+    pub next_bidder_idx: usize,
 }
 
 // ── Combat State ───────────────────────────────────────────────────────
@@ -343,6 +344,7 @@ pub struct CombatState {
     pub phase: CombatPhase,
     pub aeron_resolved: bool,
     pub tyrion_resolved: bool,
+    pub pending_support_houses: Vec<(AreaId, HouseName)>,
 }
 
 // ── House Profile (per-player state) ───────────────────────────────────
@@ -442,6 +444,7 @@ pub enum PendingDecision {
     },
     /// Robb Stark: winner chooses defender retreat area
     RobbRetreat {
+        house: HouseName,
         possible_areas: Vec<AreaId>,
     },
     /// Generic retreat: loser picks retreat destination
@@ -465,15 +468,19 @@ pub enum PendingDecision {
     },
     /// Bidding (Clash of Kings / Wildling Attack)
     Bidding {
+        house: HouseName,
         bidding_type: BiddingType,
         track: Option<Track>,
     },
     /// Choose whether to leave a power token when vacating land
     LeavePowerToken {
+        house: HouseName,
         area_id: AreaId,
     },
     /// Use Valyrian Steel Blade in combat?
-    UseValyrianBlade,
+    UseValyrianBlade {
+        house: HouseName,
+    },
     /// Place orders (planning phase)
     PlaceOrders {
         house: HouseName,
@@ -560,6 +567,18 @@ pub struct GameState {
 
     // Active combat (if any)
     pub combat: Option<CombatState>,
+
+    // Bidding state (Clash of Kings / Wildling Attack)
+    pub bidding: Option<BiddingState>,
+
+    // Westeros phase tracking
+    pub westeros_cards_drawn: Vec<WesterosCard>,
+    pub westeros_step: u8,
+    pub muster_house_idx: u8,
+
+    // Deterministic RNG
+    pub seed: u64,
+    pub rng_counter: u64,
 
     // Current pending decision the game is waiting on
     pub pending: Option<PendingDecision>,

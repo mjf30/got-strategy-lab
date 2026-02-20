@@ -72,7 +72,10 @@ pub fn run_game(
         } else if state.winner.is_none() {
             // No pending and no winner — shouldn't happen
             // Engine should always either set pending or advance
-            return Err("Game stuck: no pending decision and no winner".into());
+            return Err(format!(
+                "Game stuck: phase={:?}, round={}, step={}",
+                state.phase, state.round, state.westeros_step
+            ));
         }
     }
 }
@@ -95,12 +98,11 @@ fn pending_house(pending: &PendingDecision) -> HouseName {
         PendingDecision::CerseiRemoveOrder { opponent } => *opponent,
         PendingDecision::DoranChooseTrack { opponent } => *opponent,
         PendingDecision::QueenOfThornsRemoveOrder { opponent } => *opponent,
-        // These don't specify a house directly — use current player
-        PendingDecision::LeavePowerToken { .. } => HouseName::Stark, // Placeholder
-        PendingDecision::UseValyrianBlade => HouseName::Stark,
-        PendingDecision::Bidding { .. } => HouseName::Stark,
+        PendingDecision::LeavePowerToken { house, .. } => *house,
+        PendingDecision::UseValyrianBlade { house } => *house,
+        PendingDecision::Bidding { house, .. } => *house,
         PendingDecision::WesterosChoice { chooser, .. } => *chooser,
-        PendingDecision::RobbRetreat { .. } => HouseName::Stark,
+        PendingDecision::RobbRetreat { house, .. } => *house,
     }
 }
 

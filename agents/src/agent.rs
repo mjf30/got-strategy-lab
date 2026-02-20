@@ -41,7 +41,7 @@ pub trait Agent: Send + Sync {
                 let (to, units) = self.choose_march(view, *from_area, valid_destinations);
                 Action::March { to, unit_indices: units }
             }
-            PendingDecision::LeavePowerToken { area_id } => {
+            PendingDecision::LeavePowerToken { area_id, .. } => {
                 Action::LeavePowerToken(self.leave_power_token(view, *area_id))
             }
             PendingDecision::SupportDeclaration { attacker, defender, .. } => {
@@ -50,10 +50,10 @@ pub trait Agent: Send + Sync {
             PendingDecision::SelectHouseCard { available_cards, .. } => {
                 Action::SelectCard(self.select_house_card(view, available_cards))
             }
-            PendingDecision::UseValyrianBlade => {
+            PendingDecision::UseValyrianBlade { .. } => {
                 Action::UseValyrianBlade(self.use_valyrian_blade(view))
             }
-            PendingDecision::Bidding { bidding_type, track } => {
+            PendingDecision::Bidding { bidding_type, track, .. } => {
                 Action::Bid(self.submit_bid(view, *bidding_type, *track))
             }
             PendingDecision::WesterosChoice { options, .. } => {
