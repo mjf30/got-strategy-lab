@@ -1,0 +1,11 @@
+﻿[package]
+name = "got-agents"
+version = "0.1.0"
+edition = "2021"
+description = "AI agents for the GoT board game strategy tournament"
+
+[dependencies]
+got-engine = { path = "../engine" }
+serde = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }

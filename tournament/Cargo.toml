@@ -1,0 +1,15 @@
+﻿[package]
+name = "got-tournament"
+version = "0.1.0"
+edition = "2021"
+description = "Tournament runner, ELO system, and result storage"
+
+[dependencies]
+got-engine = { path = "../engine" }
+got-agents = { path = "../agents" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rayon = "1.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
