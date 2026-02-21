@@ -88,14 +88,27 @@ fn get_muster_areas(state: &GameState, house: HouseName) -> Vec<MusterArea> {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub fn advance(state: &mut GameState) {
-    if state.pending.is_some() || state.winner.is_some() {
-        return;
-    }
-    match state.phase {
-        Phase::Westeros => advance_westeros(state),
-        Phase::Planning => advance_planning(state),
-        Phase::Action   => advance_action_phase(state),
-        Phase::Combat   => advance_combat(state),
+    // Loop instead of recursion to avoid stack overflow
+    loop {
+        if state.pending.is_some() || state.winner.is_some() {
+            return;
+        }
+        let phase_before = state.phase;
+        let round_before = state.round;
+        let step_before = state.westeros_step;
+        match state.phase {
+            Phase::Westeros => advance_westeros(state),
+            Phase::Planning => advance_planning(state),
+            Phase::Action   => advance_action_phase(state),
+            Phase::Combat   => advance_combat(state),
+        }
+        // If nothing changed (no progress), stop to prevent infinite loop
+        if state.pending.is_some() || state.winner.is_some() {
+            return;
+        }
+        if state.phase == phase_before && state.round == round_before && state.westeros_step == step_before {
+            return; // No progress made
+        }
     }
 }
 
@@ -162,7 +175,7 @@ fn advance_westeros(state: &mut GameState) {
     state.westeros_cards_drawn.clear();
     state.westeros_step = 0;
     state.phase = Phase::Planning;
-    advance(state);
+    // advance loop in public advance() will re-enter
 }
 
 /// Advance mustering: ask next house that has muster areas, or finish.
@@ -443,7 +456,7 @@ fn resolve_wildling_bidding(state: &mut GameState) {
     let total_bid: u8 = bidding.bids.values().sum();
     let threat = state.wildling_threat;
 
-    // Find highest and lowest bidders
+    // Sort by bid (descending for highest, ascending for lowest)
     let mut sorted: Vec<(HouseName, u8)> = bidding.bid_order.iter()
         .map(|&h| (h, *bidding.bids.get(&h).unwrap_or(&0)))
         .collect();
@@ -453,38 +466,317 @@ fn resolve_wildling_bidding(state: &mut GameState) {
         state.house_mut(h).power = state.house(h).power.saturating_sub(bid);
     }
 
+    // Draw wildling card
+    let wildling_card = state.wildling_deck.pop();
+    if state.wildling_deck.is_empty() {
+        // Reshuffle
+        state.wildling_deck = cards::wildling_deck();
+        let mut rng = next_rng(state);
+        state.wildling_deck.shuffle(&mut rng);
+    }
+
+    let card_type = wildling_card.map(|wc| wc.card_type);
+    use WildlingCardType::*;
+
     if total_bid >= threat {
-        // Night's Watch wins!
-        // Highest bidder (tiebreak: first in turn order) gets a reward
+        // ═══ Night's Watch wins! ═══
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
         let highest = sorted[0].0;
 
-        // Draw wildling card for specific effect
-        let wildling_card = state.wildling_deck.pop();
-        if let Some(_wc) = wildling_card {
-            // Simplified reward: highest bidder gains 2 power back
-            state.house_mut(highest).power += 2;
+        match card_type {
+            Some(AKingBeyondTheWall) => {
+                // Highest bidder: move to position 1 on any one influence track
+                // Auto: move to top of Iron Throne (most impactful)
+                let pc = state.playing_houses.len() as u8;
+                let old_pos = state.house(highest).iron_throne;
+                let houses = state.playing_houses.clone();
+                for &h in &houses {
+                    if state.house(h).iron_throne < old_pos {
+                        state.house_mut(h).iron_throne += 1;
+                    }
+                }
+                state.house_mut(highest).iron_throne = 1;
+                // Update turn order
+                let mut new_order = state.playing_houses.clone();
+                new_order.sort_by_key(|&h| state.house(h).iron_throne);
+                state.turn_order = new_order;
+                let _ = pc;
+            }
+            Some(CrowKillers) => {
+                // Highest: replace up to 2 footmen on board with available knights
+                let areas_with_footmen: Vec<(AreaId, usize)> = state.areas.iter().enumerate()
+                    .flat_map(|(i, a)| {
+                        a.units.iter().enumerate()
+                            .filter(|(_, u)| u.house == highest && u.unit_type == UnitType::Footman)
+                            .map(move |(j, _)| (AreaId(i as u8), j))
+                    })
+                    .take(2)
+                    .collect();
+                for (aid, _idx) in areas_with_footmen {
+                    if state.house(highest).available_units.knights > 0 {
+                        if let Some(pos) = state.area(aid).units.iter().position(|u| {
+                            u.house == highest && u.unit_type == UnitType::Footman
+                        }) {
+                            state.area_mut(aid).units[pos].unit_type = UnitType::Knight;
+                            state.house_mut(highest).available_units.knights -= 1;
+                            state.house_mut(highest).available_units.footmen += 1;
+                        }
+                    }
+                }
+            }
+            Some(MammothRiders) => {
+                // Highest: retrieve all power tokens bid (+5 bonus on top)
+                state.house_mut(highest).power += 5;
+            }
+            Some(MassingOnTheMilkwater) => {
+                // Highest: return all discarded house cards to hand
+                let discards = state.house(highest).discards.clone();
+                for card_id in discards {
+                    state.house_mut(highest).hand.push(card_id);
+                }
+                state.house_mut(highest).discards.clear();
+            }
+            Some(PreemptiveRaid) => {
+                // Simplified reward: +2 power (reduce wildling track)
+                state.house_mut(highest).power += 2;
+            }
+            Some(RattleshirtsRaiders) => {
+                // Highest: +2 power
+                state.house_mut(highest).power += 2;
+            }
+            Some(SilenceAtTheWall) => {
+                // Nothing happens
+            }
+            Some(SkinchangerScout) => {
+                // Simplified: highest bidder gains +2 power (in real game, peek at decks)
+                state.house_mut(highest).power += 2;
+            }
+            Some(TheHordeDescends) => {
+                // Highest: muster 2 points in any one castle/stronghold
+                // Auto: find first castle/stronghold controlled, build a footman
+                let muster_area = state.areas.iter().enumerate()
+                    .find(|(i, a)| {
+                        a.house == Some(highest) && AREAS[*i].has_castle_or_stronghold()
+                    })
+                    .map(|(i, _)| AreaId(i as u8));
+                if let Some(aid) = muster_area {
+                    if state.house(highest).available_units.footmen > 0 {
+                        state.area_mut(aid).units.push(Unit {
+                            unit_type: UnitType::Footman, house: highest, routed: false,
+                        });
+                        state.house_mut(highest).available_units.footmen -= 1;
+                    }
+                }
+            }
+            None => {
+                state.house_mut(highest).power += 2;
+            }
         }
 
         state.wildling_threat = 0;
     } else {
-        // Wildlings win!
-        // Lowest bidder (tiebreak: worst Iron Throne position) gets worst penalty
+        // ═══ Wildlings win! ═══
         sorted.sort_by(|a, b| a.1.cmp(&b.1).then(
             state.house(b.0).iron_throne.cmp(&state.house(a.0).iron_throne)
         ));
         let lowest = sorted[0].0;
+        let others: Vec<HouseName> = sorted[1..].iter().map(|&(h, _)| h).collect();
 
-        // Draw wildling card
-        let _wildling_card = state.wildling_deck.pop();
-
-        // Simplified penalty: lowest bidder loses 2 power and all others lose 1
-        state.house_mut(lowest).power = state.house(lowest).power.saturating_sub(2);
-        for &(h, _) in &sorted[1..] {
-            state.house_mut(h).power = state.house(h).power.saturating_sub(1);
+        match card_type {
+            Some(AKingBeyondTheWall) => {
+                // Lowest: move to bottom of ALL 3 influence tracks
+                let pc = state.playing_houses.len() as u8;
+                // Iron Throne
+                let old_it = state.house(lowest).iron_throne;
+                let houses = state.playing_houses.clone();
+                for &h in &houses {
+                    if state.house(h).iron_throne > old_it {
+                        state.house_mut(h).iron_throne -= 1;
+                    }
+                }
+                state.house_mut(lowest).iron_throne = pc;
+                // Fiefdoms
+                let old_f = state.house(lowest).fiefdoms;
+                for &h in &houses {
+                    if state.house(h).fiefdoms > old_f {
+                        state.house_mut(h).fiefdoms -= 1;
+                    }
+                }
+                state.house_mut(lowest).fiefdoms = pc;
+                // Kings Court
+                let old_kc = state.house(lowest).kings_court;
+                for &h in &houses {
+                    if state.house(h).kings_court > old_kc {
+                        state.house_mut(h).kings_court -= 1;
+                    }
+                }
+                state.house_mut(lowest).kings_court = pc;
+                // Update turn order
+                let mut new_order = state.playing_houses.clone();
+                new_order.sort_by_key(|&h| state.house(h).iron_throne);
+                state.turn_order = new_order;
+            }
+            Some(CrowKillers) => {
+                // Lowest: all knights become footmen (if footmen available in pool)
+                let knight_areas: Vec<(AreaId, Vec<usize>)> = state.areas.iter().enumerate()
+                    .filter_map(|(i, a)| {
+                        let positions: Vec<usize> = a.units.iter().enumerate()
+                            .filter(|(_, u)| u.house == lowest && u.unit_type == UnitType::Knight)
+                            .map(|(j, _)| j)
+                            .collect();
+                        if positions.is_empty() { None } else { Some((AreaId(i as u8), positions)) }
+                    })
+                    .collect();
+                for (aid, positions) in knight_areas {
+                    for pos in positions.into_iter().rev() {
+                        if state.house(lowest).available_units.footmen > 0 {
+                            state.area_mut(aid).units[pos].unit_type = UnitType::Footman;
+                            state.house_mut(lowest).available_units.footmen -= 1;
+                            state.house_mut(lowest).available_units.knights += 1;
+                        }
+                    }
+                }
+                // Others: lose 1 power each
+                for &h in &others {
+                    state.house_mut(h).power = state.house(h).power.saturating_sub(1);
+                }
+            }
+            Some(MammothRiders) => {
+                // Lowest: destroy 3 of their units (auto: remove from areas with most units first)
+                let mut destroyed = 0u8;
+                while destroyed < 3 {
+                    // Find area with a unit belonging to lowest
+                    let area_idx = state.areas.iter().enumerate()
+                        .filter(|(_, a)| a.units.iter().any(|u| u.house == lowest))
+                        .max_by_key(|(_, a)| a.units.iter().filter(|u| u.house == lowest).count())
+                        .map(|(i, _)| i);
+                    if let Some(idx) = area_idx {
+                        if let Some(pos) = state.areas[idx].units.iter().position(|u| u.house == lowest) {
+                            let unit = state.areas[idx].units.remove(pos);
+                            *state.house_mut(lowest).available_units.get_mut(unit.unit_type) += 1;
+                            destroyed += 1;
+                        } else { break; }
+                    } else { break; }
+                }
+                // Others: destroy 1 unit each
+                for &h in &others {
+                    let area_idx = state.areas.iter().enumerate()
+                        .find(|(_, a)| a.units.iter().any(|u| u.house == h))
+                        .map(|(i, _)| i);
+                    if let Some(idx) = area_idx {
+                        if let Some(pos) = state.areas[idx].units.iter().position(|u| u.house == h) {
+                            let unit = state.areas[idx].units.remove(pos);
+                            *state.house_mut(h).available_units.get_mut(unit.unit_type) += 1;
+                        }
+                    }
+                }
+            }
+            Some(MassingOnTheMilkwater) => {
+                // Lowest: discard entire hand
+                let hand = state.house(lowest).hand.clone();
+                for card_id in hand {
+                    state.house_mut(lowest).discards.push(card_id);
+                }
+                state.house_mut(lowest).hand.clear();
+            }
+            Some(PreemptiveRaid) => {
+                // Lowest: destroy 2 units (simplified, auto-pick)
+                let mut destroyed = 0u8;
+                while destroyed < 2 {
+                    let area_idx = state.areas.iter().enumerate()
+                        .filter(|(_, a)| a.units.iter().any(|u| u.house == lowest))
+                        .max_by_key(|(_, a)| a.units.iter().filter(|u| u.house == lowest).count())
+                        .map(|(i, _)| i);
+                    if let Some(idx) = area_idx {
+                        if let Some(pos) = state.areas[idx].units.iter().position(|u| u.house == lowest) {
+                            let unit = state.areas[idx].units.remove(pos);
+                            *state.house_mut(lowest).available_units.get_mut(unit.unit_type) += 1;
+                            destroyed += 1;
+                        } else { break; }
+                    } else { break; }
+                }
+            }
+            Some(RattleshirtsRaiders) => {
+                // Lowest: lose ALL remaining power tokens
+                state.house_mut(lowest).power = 0;
+                // Others: lose 1 power each
+                for &h in &others {
+                    state.house_mut(h).power = state.house(h).power.saturating_sub(1);
+                }
+            }
+            Some(SilenceAtTheWall) => {
+                // Nothing happens
+            }
+            Some(SkinchangerScout) => {
+                // Lowest: discard all power tokens
+                state.house_mut(lowest).power = 0;
+            }
+            Some(TheHordeDescends) => {
+                // Lowest: destroy 2 of their strongest units (knight>siege>footman>ship)
+                let mut destroyed = 0u8;
+                while destroyed < 2 {
+                    // Find strongest unit
+                    let best = state.areas.iter().enumerate()
+                        .flat_map(|(i, a)| {
+                            a.units.iter().enumerate()
+                                .filter(|(_, u)| u.house == lowest)
+                                .map(move |(j, u)| (AreaId(i as u8), j, u.unit_type))
+                        })
+                        .max_by_key(|&(_, _, ut)| match ut {
+                            UnitType::Knight => 4,
+                            UnitType::SiegeEngine => 3,
+                            UnitType::Footman => 2,
+                            UnitType::Ship => 1,
+                        });
+                    if let Some((aid, _pos, _ut)) = best {
+                        // Re-find position (indices may have shifted)
+                        if let Some(pos) = state.area(aid).units.iter().position(|u| u.house == lowest) {
+                            let unit = state.area_mut(aid).units.remove(pos);
+                            *state.house_mut(lowest).available_units.get_mut(unit.unit_type) += 1;
+                            destroyed += 1;
+                        } else { break; }
+                    } else { break; }
+                }
+                // Others: destroy 1 unit each
+                for &h in &others {
+                    let area_idx = state.areas.iter().enumerate()
+                        .find(|(_, a)| a.units.iter().any(|u| u.house == h))
+                        .map(|(i, _)| i);
+                    if let Some(idx) = area_idx {
+                        if let Some(pos) = state.areas[idx].units.iter().position(|u| u.house == h) {
+                            let unit = state.areas[idx].units.remove(pos);
+                            *state.house_mut(h).available_units.get_mut(unit.unit_type) += 1;
+                        }
+                    }
+                }
+            }
+            None => {
+                // Generic fallback
+                state.house_mut(lowest).power = state.house(lowest).power.saturating_sub(2);
+                for &h in &others {
+                    state.house_mut(h).power = state.house(h).power.saturating_sub(1);
+                }
+            }
         }
 
         state.wildling_threat = 2;
+    }
+
+    // Check for empty areas that lost their last unit
+    let houses = state.playing_houses.clone();
+    for (i, area) in state.areas.iter_mut().enumerate() {
+        let def = &AREAS[i];
+        if def.area_type == AreaType::Land && area.units.is_empty() {
+            if let Some(h) = area.house {
+                if !houses.contains(&h) || !area.units.iter().any(|u| u.house == h) {
+                    // Don't clear control if house has garrison or power token
+                    // Simplified: just clear if no units
+                    if area.units.is_empty() {
+                        area.house = None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -499,7 +791,7 @@ fn advance_planning(state: &mut GameState) {
 
     // Find next house that needs to place orders (in turn order)
     for &h in &state.turn_order.clone() {
-        let needs_orders = state.areas.iter().enumerate().any(|(_, area)| {
+        let needs_orders = state.areas.iter().any(|area| {
             area.house == Some(h) && !area.units.is_empty() && area.order.is_none()
         });
         if needs_orders {
@@ -520,7 +812,7 @@ fn advance_planning(state: &mut GameState) {
     state.phase = Phase::Action;
     state.action_sub_phase = ActionSubPhase::Raid;
     state.action_player_index = 0;
-    advance(state);
+    // advance loop will re-enter
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -537,9 +829,7 @@ fn advance_action_phase(state: &mut GameState) {
     loop {
         if state.action_sub_phase == ActionSubPhase::Done {
             cleanup_round(state);
-            if state.winner.is_none() {
-                advance(state);
-            }
+            // advance loop will re-enter
             return;
         }
 
@@ -618,14 +908,14 @@ fn find_first_order_area(state: &GameState, house: HouseName, order_type: OrderT
     state.areas.iter().enumerate()
         .find(|(_, a)| {
             a.house == Some(house) &&
-            a.order.map_or(false, |o| o.order_type == order_type)
+            a.order.is_some_and(|o| o.order_type == order_type)
         })
         .map(|(i, _)| AreaId(i as u8))
 }
 
 fn resolve_single_consolidate_power(state: &mut GameState, house: HouseName, area_id: AreaId) {
     let area_def = &AREAS[area_id.0 as usize];
-    let is_star = state.area(area_id).order.map_or(false, |o| o.star);
+    let is_star = state.area(area_id).order.is_some_and(|o| o.star);
 
     if is_star && area_def.has_castle_or_stronghold() {
         // CP★ on castle/stronghold → mustering at this area
@@ -651,169 +941,158 @@ fn resolve_single_consolidate_power(state: &mut GameState, house: HouseName, are
 // ═══════════════════════════════════════════════════════════════════════
 
 fn advance_combat(state: &mut GameState) {
-    if state.pending.is_some() || state.winner.is_some() {
-        return;
-    }
-
-    let combat_data = match &state.combat {
-        Some(c) => (c.phase, c.attacker, c.defender, c.area_id),
-        None => {
-            state.phase = Phase::Action;
-            advance(state);
+    loop {
+        if state.pending.is_some() || state.winner.is_some() {
             return;
         }
-    };
-    let (combat_phase, attacker, defender, _area_id) = combat_data;
 
-    match combat_phase {
-        CombatPhase::Support => {
-            // Find next house to ask about support
-            let pending_support = state.combat.as_ref().unwrap().pending_support_houses.clone();
-            if let Some(&(sup_area, sup_house)) = pending_support.first() {
-                state.pending = Some(PendingDecision::SupportDeclaration {
-                    house: sup_house,
-                    area_id: sup_area,
-                    attacker,
-                    defender,
-                });
+        let combat_data = match &state.combat {
+            Some(c) => (c.phase, c.attacker, c.defender, c.area_id),
+            None => {
+                state.phase = Phase::Action;
                 return;
             }
-            // All support declared → Cards phase
-            if let Some(c) = &mut state.combat {
-                c.phase = CombatPhase::Cards;
-            }
-            advance_combat(state);
-        }
+        };
+        let (combat_phase, attacker, defender, _area_id) = combat_data;
 
-        CombatPhase::Cards => {
-            let atk_card = state.combat.as_ref().unwrap().attacker_card;
-            let def_card = state.combat.as_ref().unwrap().defender_card;
-
-            if atk_card.is_none() {
-                let available = state.house(attacker).hand.clone();
-                if available.is_empty() {
-                    // No cards → skip
-                    if let Some(c) = &mut state.combat { c.attacker_card = Some(HouseCardId::EddardStark); } // placeholder
-                    advance_combat(state);
-                } else {
-                    state.pending = Some(PendingDecision::SelectHouseCard {
-                        house: attacker,
-                        available_cards: available,
+        match combat_phase {
+            CombatPhase::Support => {
+                let pending_support = state.combat.as_ref().unwrap().pending_support_houses.clone();
+                if let Some(&(sup_area, sup_house)) = pending_support.first() {
+                    state.pending = Some(PendingDecision::SupportDeclaration {
+                        house: sup_house,
+                        area_id: sup_area,
+                        attacker,
+                        defender,
                     });
+                    return;
                 }
+                if let Some(c) = &mut state.combat {
+                    c.phase = CombatPhase::Cards;
+                }
+                continue; // re-enter loop for Cards phase
+            }
+
+            CombatPhase::Cards => {
+                let atk_card = state.combat.as_ref().unwrap().attacker_card;
+                let def_card = state.combat.as_ref().unwrap().defender_card;
+
+                if atk_card.is_none() {
+                    let available = state.house(attacker).hand.clone();
+                    if available.is_empty() {
+                        // No cards → skip to defender
+                    } else {
+                        state.pending = Some(PendingDecision::SelectHouseCard {
+                            house: attacker,
+                            available_cards: available,
+                        });
+                        return;
+                    }
+                }
+
+                if def_card.is_none() {
+                    let available = state.house(defender).hand.clone();
+                    if available.is_empty() {
+                        // No cards → skip to PreCombat
+                    } else {
+                        state.pending = Some(PendingDecision::SelectHouseCard {
+                            house: defender,
+                            available_cards: available,
+                        });
+                        return;
+                    }
+                }
+
+                // Both cards selected → PreCombat
+                if let Some(c) = &mut state.combat {
+                    c.phase = CombatPhase::PreCombat;
+                }
+                continue;
+            }
+
+            CombatPhase::PreCombat => {
+                let combat = state.combat.as_ref().unwrap();
+                if !combat.tyrion_resolved {
+                    let atk_card = combat.attacker_card;
+                    let def_card = combat.defender_card;
+
+                    if atk_card == Some(HouseCardId::TyrionLannister) {
+                      if let Some(old_card) = def_card {
+                        if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
+                        state.house_mut(defender).hand.push(old_card);
+                        if let Some(pos) = state.house(defender).discards.iter().position(|&c| c == old_card) {
+                            state.house_mut(defender).discards.remove(pos);
+                        }
+                        if let Some(c) = &mut state.combat { c.defender_card = None; }
+                        state.pending = Some(PendingDecision::TyrionReplace { opponent: defender });
+                        return;
+                      }
+                    }
+
+                    if def_card == Some(HouseCardId::TyrionLannister) {
+                      if let Some(old_card) = atk_card {
+                        if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
+                        state.house_mut(attacker).hand.push(old_card);
+                        if let Some(pos) = state.house(attacker).discards.iter().position(|&c| c == old_card) {
+                            state.house_mut(attacker).discards.remove(pos);
+                        }
+                        if let Some(c) = &mut state.combat { c.attacker_card = None; }
+                        state.pending = Some(PendingDecision::TyrionReplace { opponent: attacker });
+                        return;
+                      }
+                    }
+
+                    if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
+                }
+
+                let combat = state.combat.as_ref().unwrap();
+                if !combat.aeron_resolved {
+                    let atk_card = combat.attacker_card;
+                    let def_card = combat.defender_card;
+
+                    if atk_card == Some(HouseCardId::AeronDamphair) && state.house(attacker).power >= 2 {
+                        if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
+                        state.pending = Some(PendingDecision::AeronSwap { house: attacker });
+                        return;
+                    }
+                    if def_card == Some(HouseCardId::AeronDamphair) && state.house(defender).power >= 2 {
+                        if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
+                        state.pending = Some(PendingDecision::AeronSwap { house: defender });
+                        return;
+                    }
+
+                    if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
+                }
+
+                if let Some(c) = &mut state.combat {
+                    c.phase = CombatPhase::Resolution;
+                }
+                continue;
+            }
+
+            CombatPhase::Resolution => {
+                let blade_holder = find_track_holder(state, Track::Fiefdoms);
+                if !state.valyrian_steel_blade_used {
+                    let in_combat = blade_holder == attacker || blade_holder == defender;
+                    if in_combat {
+                        state.pending = Some(PendingDecision::UseValyrianBlade { house: blade_holder });
+                        if let Some(c) = &mut state.combat {
+                            c.phase = CombatPhase::PostCombat;
+                        }
+                        return;
+                    }
+                }
+
+                if let Some(c) = &mut state.combat {
+                    c.phase = CombatPhase::PostCombat;
+                }
+                continue;
+            }
+
+            CombatPhase::PostCombat => {
+                resolve_combat_final(state);
                 return;
             }
-
-            if def_card.is_none() {
-                let available = state.house(defender).hand.clone();
-                if available.is_empty() {
-                    if let Some(c) = &mut state.combat { c.defender_card = Some(HouseCardId::EddardStark); }
-                    advance_combat(state);
-                } else {
-                    state.pending = Some(PendingDecision::SelectHouseCard {
-                        house: defender,
-                        available_cards: available,
-                    });
-                }
-                return;
-            }
-
-            // Both cards selected → PreCombat (Tyrion, Aeron)
-            if let Some(c) = &mut state.combat {
-                c.phase = CombatPhase::PreCombat;
-            }
-            advance_combat(state);
-        }
-
-        CombatPhase::PreCombat => {
-            // Check Tyrion Lannister (cancel opponent's card)
-            let combat = state.combat.as_ref().unwrap();
-            if !combat.tyrion_resolved {
-                let atk_card = combat.attacker_card.unwrap();
-                let def_card = combat.defender_card.unwrap();
-
-                // Check if attacker played Tyrion
-                if atk_card == HouseCardId::TyrionLannister {
-                    if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
-                    // Cancel defender's card — ask them to choose a replacement
-                    let old_card = def_card;
-                    // Return cancelled card to hand
-                    state.house_mut(defender).hand.push(old_card);
-                    if let Some(pos) = state.house(defender).discards.iter().position(|&c| c == old_card) {
-                        state.house_mut(defender).discards.remove(pos);
-                    }
-                    if let Some(c) = &mut state.combat { c.defender_card = None; }
-                    let _available = state.house(defender).hand.clone();
-                    state.pending = Some(PendingDecision::TyrionReplace { opponent: defender });
-                    return;
-                }
-
-                // Check if defender played Tyrion
-                if def_card == HouseCardId::TyrionLannister {
-                    if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
-                    let old_card = atk_card;
-                    state.house_mut(attacker).hand.push(old_card);
-                    if let Some(pos) = state.house(attacker).discards.iter().position(|&c| c == old_card) {
-                        state.house_mut(attacker).discards.remove(pos);
-                    }
-                    if let Some(c) = &mut state.combat { c.attacker_card = None; }
-                    state.pending = Some(PendingDecision::TyrionReplace { opponent: attacker });
-                    return;
-                }
-
-                if let Some(c) = &mut state.combat { c.tyrion_resolved = true; }
-            }
-
-            // Check Aeron Damphair (pay 2 power to swap card)
-            let combat = state.combat.as_ref().unwrap();
-            if !combat.aeron_resolved {
-                let atk_card = combat.attacker_card.unwrap();
-                let def_card = combat.defender_card.unwrap();
-
-                if atk_card == HouseCardId::AeronDamphair && state.house(attacker).power >= 2 {
-                    if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
-                    state.pending = Some(PendingDecision::AeronSwap { house: attacker });
-                    return;
-                }
-                if def_card == HouseCardId::AeronDamphair && state.house(defender).power >= 2 {
-                    if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
-                    state.pending = Some(PendingDecision::AeronSwap { house: defender });
-                    return;
-                }
-
-                if let Some(c) = &mut state.combat { c.aeron_resolved = true; }
-            }
-
-            // Move to Resolution
-            if let Some(c) = &mut state.combat {
-                c.phase = CombatPhase::Resolution;
-            }
-            advance_combat(state);
-        }
-
-        CombatPhase::Resolution => {
-            // Ask blade holder if they want to use it (+1 strength)
-            let blade_holder = find_track_holder(state, Track::Fiefdoms);
-            if !state.valyrian_steel_blade_used {
-                let in_combat = blade_holder == attacker || blade_holder == defender;
-                if in_combat {
-                    state.pending = Some(PendingDecision::UseValyrianBlade { house: blade_holder });
-                    // Move to PostCombat after blade decision
-                    if let Some(c) = &mut state.combat {
-                        c.phase = CombatPhase::PostCombat;
-                    }
-                    return;
-                }
-            }
-
-            if let Some(c) = &mut state.combat {
-                c.phase = CombatPhase::PostCombat;
-            }
-            advance_combat(state);
-        }
-
-        CombatPhase::PostCombat => {
-            resolve_combat_final(state);
         }
     }
 }
@@ -892,12 +1171,8 @@ fn resolve_combat_final(state: &mut GameState) {
     let march_from_area = combat.march_from_area;
     let support_decisions = combat.support_decisions.clone();
 
-    let atk_card = atk_card_id.and_then(|id| {
-        if state.house(attacker).hand.contains(&id) || state.house(attacker).discards.contains(&id) || true {
-            Some(cards::get_house_card(id))
-        } else { None }
-    });
-    let def_card = def_card_id.and_then(|id| Some(cards::get_house_card(id)));
+    let atk_card = atk_card_id.map(cards::get_house_card);
+    let def_card = def_card_id.map(cards::get_house_card);
 
     // ── Compute strengths ──
 
@@ -930,9 +1205,8 @@ fn resolve_combat_final(state: &mut GameState) {
         .filter(|o| o.order_type == OrderType::Defense)
         .map_or(0, |o| o.strength as i16);
 
-    // Garrison defense
+    // Garrison defense (helps whoever is defending the area)
     let garrison_str: i16 = state.garrisons.get(&area_id)
-        .filter(|g| g.house == defender)
         .map_or(0, |g| g.strength as i16);
 
     // Support strength
@@ -957,19 +1231,119 @@ fn resolve_combat_final(state: &mut GameState) {
     let atk_blade: i16 = if state.combat.as_ref().unwrap().attacker_used_blade { 1 } else { 0 };
     let def_blade: i16 = if state.combat.as_ref().unwrap().defender_used_blade { 1 } else { 0 };
 
-    // Card abilities: Catelyn Stark bonus
+    // Card abilities: combat modifiers
     let mut atk_ability_bonus: i16 = 0;
     let mut def_ability_bonus: i16 = 0;
+
+    // Catelyn Stark: +1 per own discard pile size
     if atk_card_id == Some(HouseCardId::CatelynStark) {
-        // +1 per Stark card in discard
         atk_ability_bonus += state.house(attacker).discards.len() as i16;
     }
     if def_card_id == Some(HouseCardId::CatelynStark) {
         def_ability_bonus += state.house(defender).discards.len() as i16;
     }
 
-    let atk_total = atk_unit_str + atk_card_str + march_bonus + atk_support + atk_blade + atk_ability_bonus;
-    let def_total = def_unit_str + def_card_str + defense_bonus + garrison_str + def_support + def_blade + def_ability_bonus;
+    // Stannis Baratheon: +1 per own ship in adjacent sea zones
+    if atk_card_id == Some(HouseCardId::StannisBaratheon) {
+        let adjacent_ships: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| AREAS[adj.0 as usize].area_type == AreaType::Sea)
+            .flat_map(|&adj| state.area(adj).units.iter())
+            .filter(|u| u.house == attacker && u.unit_type == UnitType::Ship)
+            .count() as i16;
+        atk_ability_bonus += adjacent_ships;
+    }
+    if def_card_id == Some(HouseCardId::StannisBaratheon) {
+        let adjacent_ships: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| AREAS[adj.0 as usize].area_type == AreaType::Sea)
+            .flat_map(|&adj| state.area(adj).units.iter())
+            .filter(|u| u.house == defender && u.unit_type == UnitType::Ship)
+            .count() as i16;
+        def_ability_bonus += adjacent_ships;
+    }
+
+    // Victarion Greyjoy: +1 per own ship in adjacent port/sea
+    if atk_card_id == Some(HouseCardId::VictarionGreyjoy) {
+        let adjacent_ships: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| {
+                let at = AREAS[adj.0 as usize].area_type;
+                at == AreaType::Sea || at == AreaType::Port
+            })
+            .flat_map(|&adj| state.area(adj).units.iter())
+            .filter(|u| u.house == attacker && u.unit_type == UnitType::Ship)
+            .count() as i16;
+        atk_ability_bonus += adjacent_ships;
+    }
+    if def_card_id == Some(HouseCardId::VictarionGreyjoy) {
+        let adjacent_ships: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| {
+                let at = AREAS[adj.0 as usize].area_type;
+                at == AreaType::Sea || at == AreaType::Port
+            })
+            .flat_map(|&adj| state.area(adj).units.iter())
+            .filter(|u| u.house == defender && u.unit_type == UnitType::Ship)
+            .count() as i16;
+        def_ability_bonus += adjacent_ships;
+    }
+
+    // Mace Tyrell: +1 for each own supporting area
+    if atk_card_id == Some(HouseCardId::MaceTyrell) {
+        let own_support_count: i16 = support_decisions.iter()
+            .filter(|(_, &choice)| choice == SupportChoice::Attacker)
+            .filter(|(&sup_area, _)| state.area(sup_area).house == Some(attacker))
+            .count() as i16;
+        atk_ability_bonus += own_support_count;
+    }
+    if def_card_id == Some(HouseCardId::MaceTyrell) {
+        let own_support_count: i16 = support_decisions.iter()
+            .filter(|(_, &choice)| choice == SupportChoice::Defender)
+            .filter(|(&sup_area, _)| state.area(sup_area).house == Some(defender))
+            .count() as i16;
+        def_ability_bonus += own_support_count;
+    }
+
+    // The Blackfish: +1 per own land area adjacent to combat area
+    if atk_card_id == Some(HouseCardId::TheBlackfish) {
+        let adj_land_count: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| AREAS[adj.0 as usize].area_type == AreaType::Land && state.area(adj).house == Some(attacker))
+            .count() as i16;
+        atk_ability_bonus += adj_land_count;
+    }
+    if def_card_id == Some(HouseCardId::TheBlackfish) {
+        let adj_land_count: i16 = area_def.adjacent.iter()
+            .filter(|&&adj| AREAS[adj.0 as usize].area_type == AreaType::Land && state.area(adj).house == Some(defender))
+            .count() as i16;
+        def_ability_bonus += adj_land_count;
+    }
+
+    // Ser Jaime Lannister: +1 if attacking (only for attacker)
+    if atk_card_id == Some(HouseCardId::SerJaimeLannister) {
+        atk_ability_bonus += 1;
+    }
+
+    // Greatjon Umber: +1 if attacking
+    if atk_card_id == Some(HouseCardId::GreatjonUmber) {
+        atk_ability_bonus += 1;
+    }
+
+    // Obara Sand: +1 if defending
+    if def_card_id == Some(HouseCardId::ObaraSand) {
+        def_ability_bonus += 1;
+    }
+
+    // Balon Greyjoy: enemies may not support
+    let final_atk_support = if def_card_id == Some(HouseCardId::BalonGreyjoy) {
+        0 // Defender played Balon → attacker gets no support
+    } else {
+        atk_support
+    };
+    let final_def_support = if atk_card_id == Some(HouseCardId::BalonGreyjoy) {
+        0 // Attacker played Balon → defender gets no support
+    } else {
+        def_support
+    };
+
+    let atk_total = atk_unit_str + atk_card_str + march_bonus + final_atk_support + atk_blade + atk_ability_bonus;
+    let def_total = def_unit_str + def_card_str + defense_bonus + garrison_str + final_def_support + def_blade + def_ability_bonus;
 
     // Write back strengths
     if let Some(c) = &mut state.combat {
@@ -996,24 +1370,51 @@ fn resolve_combat_final(state: &mut GameState) {
     };
     let casualties = winner_swords.saturating_sub(loser_forts) as usize;
 
+    // ── Special casualty modifiers ──
+
+    // Renly Baratheon: defender takes no casualties this combat
+    let renly_no_casualties = (def_card_id == Some(HouseCardId::RenlyBaratheon) && !attacker_wins)
+        || (atk_card_id == Some(HouseCardId::RenlyBaratheon) && attacker_wins);
+
+    // Arianne Martell: no casualties, all units return (both sides)
+    let arianne_played = atk_card_id == Some(HouseCardId::ArianneMartell)
+        || def_card_id == Some(HouseCardId::ArianneMartell);
+
+    let effective_casualties = if arianne_played || renly_no_casualties {
+        0
+    } else {
+        casualties
+    };
+
     // ── Apply result ──
 
     if attacker_wins {
         // Kill defender casualties
         let mut killed = 0;
         let mut remaining_defenders: Vec<Unit> = defending_units.clone();
-        while killed < casualties && !remaining_defenders.is_empty() {
-            let unit = remaining_defenders.remove(0);
-            *state.house_mut(defender).available_units.get_mut(unit.unit_type) += 1;
-            killed += 1;
+        if !arianne_played {
+            while killed < effective_casualties && !remaining_defenders.is_empty() {
+                let unit = remaining_defenders.remove(0);
+                *state.house_mut(defender).available_units.get_mut(unit.unit_type) += 1;
+                killed += 1;
+            }
         }
 
-        // Place attacking units in conquered area
-        state.area_mut(area_id).units.retain(|u| u.house != defender);
-        for unit in &attacking_units {
-            state.area_mut(area_id).units.push(*unit);
+        if arianne_played {
+            // Arianne: both sides return to their areas, no one conquers
+            // Attacker returns to origin
+            // Defender stays
+            // No territory change
+        } else {
+            // Place attacking units in conquered area
+            state.area_mut(area_id).units.retain(|u| u.house != defender);
+            for unit in &attacking_units {
+                state.area_mut(area_id).units.push(*unit);
+            }
+            state.area_mut(area_id).house = Some(attacker);
+            // Remove garrison when area changes hands
+            state.garrisons.remove(&area_id);
         }
-        state.area_mut(area_id).house = Some(attacker);
 
         // Roose Bolton: returns to hand instead of discard
         if def_card_id == Some(HouseCardId::RooseBolton) {
@@ -1030,12 +1431,66 @@ fn resolve_combat_final(state: &mut GameState) {
             state.house_mut(attacker).power += steal;
         }
 
+        // Ser Davos Seaworth: winner upgrades 1 footman to knight
+        if atk_card_id == Some(HouseCardId::SerDavosSeaworth)
+            && state.house(attacker).available_units.knights > 0 {
+                if let Some(pos) = state.area(area_id).units.iter().position(|u| {
+                    u.house == attacker && u.unit_type == UnitType::Footman
+                }) {
+                    state.area_mut(area_id).units[pos].unit_type = UnitType::Knight;
+                    state.house_mut(attacker).available_units.knights -= 1;
+                    state.house_mut(attacker).available_units.footmen += 1;
+                }
+            }
+
+        // Theon Greyjoy: if won by 2+ strength, steal 1 power from loser
+        if atk_card_id == Some(HouseCardId::TheonGreyjoy) && (atk_total - def_total) >= 2 {
+            let steal = state.house(defender).power.min(1);
+            state.house_mut(defender).power -= steal;
+            state.house_mut(attacker).power += steal;
+        }
+
+        // Ser Kevan Lannister: loser steals power tokens = opponent's card strength
+        if def_card_id == Some(HouseCardId::SerKevanLannister) {
+            let card_str = atk_card.map_or(0, |c| c.strength);
+            let steal = state.house(attacker).power.min(card_str);
+            state.house_mut(attacker).power -= steal;
+            state.house_mut(defender).power += steal;
+        }
+
+        // Melisandre: opponent must discard their highest strength house card from hand
+        if atk_card_id == Some(HouseCardId::Melisandre) {
+            let hand = state.house(defender).hand.clone();
+            if !hand.is_empty() {
+                let best = hand.iter()
+                    .max_by_key(|&&c| cards::get_house_card(c).strength)
+                    .copied()
+                    .unwrap();
+                if let Some(pos) = state.house(defender).hand.iter().position(|&c| c == best) {
+                    state.house_mut(defender).hand.remove(pos);
+                    state.house_mut(defender).discards.push(best);
+                }
+            }
+        }
+
         // Post-combat: Cersei Lannister (remove one enemy order)
         if atk_card_id == Some(HouseCardId::CerseiLannister) {
             state.pending = Some(PendingDecision::CerseiRemoveOrder { opponent: defender });
             check_victory(state);
             // Don't clear combat yet — will be cleared after Cersei decision
             return;
+        }
+
+        // Asha Greyjoy: if defender (loser) played Asha, retreat to home area
+        if def_card_id == Some(HouseCardId::AshaGreyjoy) && !remaining_defenders.is_empty() {
+            let home = find_home_area(state, defender);
+            if let Some(home_area) = home {
+                for mut unit in remaining_defenders.drain(..) {
+                    unit.routed = true;
+                    state.area_mut(home_area).units.push(unit);
+                }
+            }
+            // If no home area fallback, fall through to normal retreat below
         }
 
         // Robb Stark: attacker chooses retreat area for defender
@@ -1071,6 +1526,16 @@ fn resolve_combat_final(state: &mut GameState) {
             }
         }
 
+        // Nymeria Sand: attacker wins, remove one defender order
+        if atk_card_id == Some(HouseCardId::NymeriaSand) {
+            let enemy_order_area = state.areas.iter().enumerate()
+                .find(|(_, a)| a.house == Some(defender) && a.order.is_some())
+                .map(|(i, _)| AreaId(i as u8));
+            if let Some(eid) = enemy_order_area {
+                state.area_mut(eid).order = None;
+            }
+        }
+
         // Patchface: look at opponent's hand, discard one
         if atk_card_id == Some(HouseCardId::Patchface) && !state.house(defender).hand.is_empty() {
             let visible = state.house(defender).hand.clone();
@@ -1094,10 +1559,12 @@ fn resolve_combat_final(state: &mut GameState) {
         // Kill attacker casualties
         let mut killed = 0;
         let mut remaining_attackers: Vec<Unit> = attacking_units.clone();
-        while killed < casualties && !remaining_attackers.is_empty() {
-            let unit = remaining_attackers.remove(0);
-            *state.house_mut(attacker).available_units.get_mut(unit.unit_type) += 1;
-            killed += 1;
+        if !arianne_played {
+            while killed < effective_casualties && !remaining_attackers.is_empty() {
+                let unit = remaining_attackers.remove(0);
+                *state.house_mut(attacker).available_units.get_mut(unit.unit_type) += 1;
+                killed += 1;
+            }
         }
 
         // Roose Bolton for attacker
@@ -1115,6 +1582,48 @@ fn resolve_combat_final(state: &mut GameState) {
             state.house_mut(defender).power += steal;
         }
 
+        // Ser Davos for defender
+        if def_card_id == Some(HouseCardId::SerDavosSeaworth)
+            && state.house(defender).available_units.knights > 0 {
+                if let Some(pos) = state.area(area_id).units.iter().position(|u| {
+                    u.house == defender && u.unit_type == UnitType::Footman
+                }) {
+                    state.area_mut(area_id).units[pos].unit_type = UnitType::Knight;
+                    state.house_mut(defender).available_units.knights -= 1;
+                    state.house_mut(defender).available_units.footmen += 1;
+                }
+            }
+
+        // Theon for defender
+        if def_card_id == Some(HouseCardId::TheonGreyjoy) && (def_total - atk_total) >= 2 {
+            let steal = state.house(attacker).power.min(1);
+            state.house_mut(attacker).power -= steal;
+            state.house_mut(defender).power += steal;
+        }
+
+        // Ser Kevan for attacker (loser)
+        if atk_card_id == Some(HouseCardId::SerKevanLannister) {
+            let card_str = def_card.map_or(0, |c| c.strength);
+            let steal = state.house(defender).power.min(card_str);
+            state.house_mut(defender).power -= steal;
+            state.house_mut(attacker).power += steal;
+        }
+
+        // Melisandre for defender
+        if def_card_id == Some(HouseCardId::Melisandre) {
+            let hand = state.house(attacker).hand.clone();
+            if !hand.is_empty() {
+                let best = hand.iter()
+                    .max_by_key(|&&c| cards::get_house_card(c).strength)
+                    .copied()
+                    .unwrap();
+                if let Some(pos) = state.house(attacker).hand.iter().position(|&c| c == best) {
+                    state.house_mut(attacker).hand.remove(pos);
+                    state.house_mut(attacker).discards.push(best);
+                }
+            }
+        }
+
         // Cersei for defender
         if def_card_id == Some(HouseCardId::CerseiLannister) {
             state.pending = Some(PendingDecision::CerseiRemoveOrder { opponent: attacker });
@@ -1122,12 +1631,51 @@ fn resolve_combat_final(state: &mut GameState) {
             return;
         }
 
-        // Return surviving attackers to origin (routed)
-        let from = march_from_area.unwrap_or(area_id);
-        for mut unit in remaining_attackers {
-            unit.routed = true;
-            state.area_mut(from).units.push(unit);
+        // Asha Greyjoy: if loser, retreat to home area
+        if atk_card_id == Some(HouseCardId::AshaGreyjoy) && !remaining_attackers.is_empty() {
+            // Find home area for attacker
+            let home = find_home_area(state, attacker);
+            if let Some(home_area) = home {
+                for mut unit in remaining_attackers {
+                    unit.routed = true;
+                    state.area_mut(home_area).units.push(unit);
+                }
+            } else {
+                // Fallback: normal retreat to origin
+                let from = march_from_area.unwrap_or(area_id);
+                for mut unit in remaining_attackers {
+                    unit.routed = true;
+                    state.area_mut(from).units.push(unit);
+                }
+            }
+        } else if arianne_played {
+            // Arianne: both sides return, attacker goes back to origin
+            let from = march_from_area.unwrap_or(area_id);
+            for unit in remaining_attackers {
+                state.area_mut(from).units.push(unit);
+            }
+        } else {
+            // Return surviving attackers to origin (routed)
+            let from = march_from_area.unwrap_or(area_id);
+            for mut unit in remaining_attackers {
+                unit.routed = true;
+                state.area_mut(from).units.push(unit);
+            }
         }
+
+        // Nymeria Sand: winner chooses enemy order to remove
+        if def_card_id == Some(HouseCardId::NymeriaSand) {
+            // Auto: find and remove first enemy order
+            let enemy_order_area = state.areas.iter().enumerate()
+                .find(|(_, a)| a.house == Some(attacker) && a.order.is_some())
+                .map(|(i, _)| AreaId(i as u8));
+            if let Some(eid) = enemy_order_area {
+                state.area_mut(eid).order = None;
+            }
+        }
+
+        // Margaery Tyrell: winner removes opponent's order in attacked area (irrelevant if defender wins, but check)
+        // Margaery is only relevant when winning — skip if it doesn't match
 
         // Patchface for defender
         if def_card_id == Some(HouseCardId::Patchface) && !state.house(attacker).hand.is_empty() {
@@ -1148,8 +1696,31 @@ fn resolve_combat_final(state: &mut GameState) {
         }
     }
 
+    // ── Ser Loras Tyrell: winner can march again from the conquered area ──
+    // Save march order before finalize_combat clears it
+    let loras_march_order = if (attacker_wins && atk_card_id == Some(HouseCardId::SerLorasTyrell))
+        || (!attacker_wins && def_card_id == Some(HouseCardId::SerLorasTyrell))
+    {
+        march_from_area.and_then(|from| state.area(from).order)
+    } else {
+        None
+    };
+    let loras_target_area = if loras_march_order.is_some() {
+        Some(area_id) // Loras: march order goes on the combat area
+    } else {
+        None
+    };
+
     // Combat done
     finalize_combat(state);
+
+    // Apply Ser Loras: place march order on area and give extra turn
+    if let (Some(order), Some(target)) = (loras_march_order, loras_target_area) {
+        state.area_mut(target).order = Some(order);
+        // Roll back action_player_index so the same player goes again
+        let pc = state.playing_houses.len() as u8;
+        state.action_player_index = (state.action_player_index + pc - 1) % pc;
+    }
 }
 
 fn finalize_combat(state: &mut GameState) {
@@ -1192,18 +1763,17 @@ pub fn apply_action(state: &mut GameState, action: Action) {
             state.house_mut(house).used_order_tokens = Vec::new();
         }
 
-        (PendingDecision::MessengerRaven { house }, Action::MessengerRaven(swap)) => {
-            if let Some((area_id, new_token_idx)) = swap {
-                let token = ORDER_TOKENS[new_token_idx as usize];
-                state.area_mut(area_id).order = Some(Order {
-                    order_type: token.order_type,
-                    strength: token.strength,
-                    star: token.star,
-                    house,
-                    token_index: new_token_idx,
-                });
-            }
+        (PendingDecision::MessengerRaven { house }, Action::MessengerRaven(Some((area_id, new_token_idx)))) => {
+            let token = ORDER_TOKENS[new_token_idx as usize];
+            state.area_mut(area_id).order = Some(Order {
+                order_type: token.order_type,
+                strength: token.strength,
+                star: token.star,
+                house,
+                token_index: new_token_idx,
+            });
         }
+        (PendingDecision::MessengerRaven { .. }, Action::MessengerRaven(None)) => {}
 
         // ── Westeros choices ──
         (PendingDecision::WesterosChoice { card_name, options, .. }, Action::WesterosChoice(idx)) => {
@@ -1333,7 +1903,7 @@ pub fn apply_action(state: &mut GameState, action: Action) {
 
             // Also check garrison
             let has_garrison = state.garrisons.get(&to)
-                .map_or(false, |g| g.house != house);
+                .is_some_and(|g| g.house.is_some_and(|h| h != house));
 
             if has_enemy_units || (target_house.is_some() && target_house != Some(house) && has_garrison) {
                 // Combat!
@@ -1461,8 +2031,8 @@ pub fn apply_action(state: &mut GameState, action: Action) {
         }
 
         // ── Combat: Aeron swap ──
-        (PendingDecision::AeronSwap { house }, Action::AeronSwap(new_card)) => {
-            if let Some(new_id) = new_card {
+        (PendingDecision::AeronSwap { .. }, Action::AeronSwap(None)) => {}
+        (PendingDecision::AeronSwap { house }, Action::AeronSwap(Some(new_id))) => {
                 // Pay 2 power
                 state.house_mut(house).power = state.house(house).power.saturating_sub(2);
                 // Return old card to hand, play new one
@@ -1491,7 +2061,6 @@ pub fn apply_action(state: &mut GameState, action: Action) {
                     hand.remove(pos);
                 }
                 state.house_mut(house).discards.push(new_id);
-            }
         }
 
         // ── Combat: Robb retreat choice ──
@@ -1579,6 +2148,7 @@ pub fn apply_action(state: &mut GameState, action: Action) {
         // ── Queen of Thorns ──
         (PendingDecision::QueenOfThornsRemoveOrder { .. }, Action::QueenOfThorns(area_id)) => {
             state.area_mut(area_id).order = None;
+            finalize_combat(state);
         }
 
         // ── Reconcile ──
@@ -1623,7 +2193,7 @@ pub fn apply_action(state: &mut GameState, action: Action) {
 
 fn find_raid_targets(state: &GameState, from: AreaId, house: HouseName) -> Vec<AreaId> {
     let from_def = &AREAS[from.0 as usize];
-    let is_star = state.area(from).order.map_or(false, |o| o.star);
+    let is_star = state.area(from).order.is_some_and(|o| o.star);
 
     from_def.adjacent.iter()
         .filter(|&&adj| {
@@ -1643,6 +2213,17 @@ fn find_raid_targets(state: &GameState, from: AreaId, house: HouseName) -> Vec<A
         })
         .copied()
         .collect()
+}
+
+fn find_home_area(_state: &GameState, house: HouseName) -> Option<AreaId> {
+    match house {
+        HouseName::Stark     => Some(WINTERFELL),
+        HouseName::Lannister => Some(LANNISPORT),
+        HouseName::Baratheon => Some(DRAGONSTONE),
+        HouseName::Greyjoy   => Some(PYKE),
+        HouseName::Tyrell    => Some(HIGHGARDEN),
+        HouseName::Martell   => Some(SUNSPEAR),
+    }
 }
 
 fn find_retreat_areas(state: &GameState, from: AreaId, house: HouseName) -> Vec<AreaId> {

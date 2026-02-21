@@ -167,21 +167,30 @@ pub fn create_initial_state(player_count: u8, seed: u64) -> GameState {
     for (house_name, setup) in &playing {
         if let Some(strength) = initial_garrison_strength(setup.home_area) {
             garrisons.insert(setup.home_area, Garrison {
-                house: *house_name,
+                house: Some(*house_name),
                 strength,
             });
         }
     }
 
-    // Neutral garrisons for fewer players
-    // 4-player: Tyrell + Martell zones get neutral garrisons
-    // 5-player: Martell zones get neutral garrisons
-    if player_count <= 4 {
-        // Highgarden, Oldtown get neutral garrison if Tyrell not playing
-        if !playing_houses.contains(&HouseName::Tyrell) {
-            // These are "neutral" — no house, but have garrison strength
-            // In the game, neutral garrisons don't have a house
-        }
+    // Neutral garrisons for absent houses (5-player: no Martell; 4-player: no Greyjoy+Martell)
+    let absent_garrison_areas: Vec<(AreaId, u8)> = if player_count == 5 {
+        // Martell absent — garrison their home and adjacent areas
+        vec![(SUNSPEAR, 5), (SALT_SHORE, 3), (YRONWOOD, 3), (STARFALL, 3)]
+    } else if player_count == 4 {
+        // Greyjoy + Martell absent
+        vec![
+            (SUNSPEAR, 5), (SALT_SHORE, 3), (YRONWOOD, 3), (STARFALL, 3),
+            (PYKE, 5), (GREYWATER_WATCH, 3),
+        ]
+    } else {
+        Vec::new()
+    };
+    for (area, strength) in absent_garrison_areas {
+        garrisons.entry(area).or_insert(Garrison {
+            house: None, // neutral
+            strength,
+        });
     }
 
     // Block areas for 3-player game (southern regions)
@@ -200,11 +209,11 @@ pub fn create_initial_state(player_count: u8, seed: u64) -> GameState {
 
     // Neutral garrison at King's Landing and The Eyrie (always)
     garrisons.entry(KINGS_LANDING).or_insert(Garrison {
-        house: HouseName::Baratheon, // placeholder — neutral in practice
+        house: None, // neutral
         strength: 5,
     });
     garrisons.entry(THE_EYRIE).or_insert(Garrison {
-        house: HouseName::Stark, // placeholder
+        house: None, // neutral
         strength: 6,
     });
 

@@ -308,7 +308,7 @@ pub fn supply_limits(supply: u8) -> &'static [u8] {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Garrison {
-    pub house: HouseName,
+    pub house: Option<HouseName>, // None = neutral (King's Landing, The Eyrie)
     pub strength: u8,
 }
 
@@ -394,6 +394,7 @@ impl UnitPool {
 
 /// Dynamic per-area state during a game.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AreaState {
     pub units: Vec<Unit>,
     pub order: Option<Order>,
@@ -401,16 +402,6 @@ pub struct AreaState {
     pub blocked: bool,             // impassable in 3-player
 }
 
-impl Default for AreaState {
-    fn default() -> Self {
-        AreaState {
-            units: Vec::new(),
-            order: None,
-            house: None,
-            blocked: false,
-        }
-    }
-}
 
 // ── Pending Decision Types ─────────────────────────────────────────────
 

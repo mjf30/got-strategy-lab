@@ -13,7 +13,7 @@ pub fn check_supply_violation(state: &GameState, house: HouseName) -> bool {
 
     // Collect armies: groups of 2+ units in same area
     let mut armies: Vec<u8> = Vec::new();
-    for (_i, area_state) in state.areas.iter().enumerate() {
+    for area_state in state.areas.iter() {
         if area_state.house == Some(house) && area_state.units.len() >= 2 {
             armies.push(area_state.units.len() as u8);
         }

@@ -121,8 +121,8 @@ pub struct AreaView {
     /// Order on this area. None if:
     /// - No order placed
     /// - Orders not yet revealed AND this isn't the viewer's area
-    /// During Planning before reveal: only viewer's own orders are visible.
-    /// After reveal: all orders are visible.
+    ///   During Planning before reveal: only viewer's own orders are visible.
+    ///   After reveal: all orders are visible.
     pub order: Option<Order>,
     /// Whether an order exists but is hidden (face-down, not yet revealed).
     pub has_hidden_order: bool,

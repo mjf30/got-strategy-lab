@@ -7,6 +7,9 @@ pub mod setup;
 pub mod engine;
 pub mod visibility;
 
+#[cfg(test)]
+mod tests;
+
 pub use types::*;
 pub use map::AREAS;
 pub use cards::*;
